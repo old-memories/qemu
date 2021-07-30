@@ -62,6 +62,10 @@ static const int syscall_allowlist[] = {
     SCMP_SYS(gettid),
     SCMP_SYS(gettimeofday),
     SCMP_SYS(getxattr),
+#ifdef CONFIG_LINUX_IO_URING
+    SCMP_SYS(io_uring_setup),
+    SCMP_SYS(io_uring_enter),
+#endif
     SCMP_SYS(linkat),
     SCMP_SYS(listxattr),
     SCMP_SYS(lseek),

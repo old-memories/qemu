@@ -20,6 +20,7 @@
 #include <sys/file.h>
 
 #define THREAD_POOL_SIZE 0
+#define URING_SIZE 128
 
 #define OFFSET_MAX 0x7fffffffffffffffLL
 
@@ -1164,17 +1165,17 @@ static void do_write_buf(fuse_req_t req, fuse_ino_t nodeid,
                          struct fuse_mbuf_iter *iter, struct fuse_bufvec *ibufv)
 {
     struct fuse_session *se = req->se;
-    struct fuse_bufvec *pbufv = ibufv;
-    struct fuse_bufvec tmpbufv = {
-        .buf[0] = ibufv->buf[0],
-        .count = 1,
-    };
     struct fuse_write_in *arg;
     size_t arg_size = sizeof(*arg);
     struct fuse_file_info fi;
 
+    assert(se->op.write_buf);
+
     memset(&fi, 0, sizeof(fi));
 
+    /* ibufv->buf[0] contains fuse_header_in and fuse_write_in */
+    /* before advance: iter points to fuse_write_in */
+    /* after advance: iter points to the data content or end of the buf */
     arg = fuse_mbuf_iter_advance(iter, arg_size);
     if (!arg) {
         fuse_reply_err(req, EINVAL);
@@ -1187,27 +1188,22 @@ static void do_write_buf(fuse_req_t req, fuse_ino_t nodeid,
     fi.writepage = !!(arg->write_flags & FUSE_WRITE_CACHE);
     fi.kill_priv = !!(arg->write_flags & FUSE_WRITE_KILL_PRIV);
 
-    if (ibufv->count == 1) {
-        assert(!(tmpbufv.buf[0].flags & FUSE_BUF_IS_FD));
-        tmpbufv.buf[0].mem = ((char *)arg) + arg_size;
-        tmpbufv.buf[0].size -= sizeof(struct fuse_in_header) + arg_size;
-        pbufv = &tmpbufv;
-    } else {
-        /*
-         *  Input bufv contains the headers in the first element
-         * and the data in the rest, we need to skip that first element
-         */
-        ibufv->buf[0].size = 0;
-    }
+    assert(ibufv->count >= 2);
 
-    if (fuse_buf_size(pbufv) != arg->size) {
+    /*
+     *  Input bufv contains the headers in the first element
+     * and the data in the rest, we need to skip that first element
+     */
+    ibufv->buf[0].size = 0;
+
+    if (fuse_buf_size(ibufv) != arg->size) {
         fuse_log(FUSE_LOG_ERR,
                  "fuse: do_write_buf: buffer size doesn't match arg->size\n");
         fuse_reply_err(req, EIO);
         return;
     }
 
-    se->op.write_buf(req, nodeid, pbufv, arg->offset, &fi);
+    se->op.write_buf(req, nodeid, ibufv, arg->offset, &fi);
 }
 
 static void do_flush(fuse_req_t req, fuse_ino_t nodeid,
@@ -2518,6 +2514,7 @@ static const struct fuse_opt fuse_ll_opts[] = {
     LL_OPTION("--socket-group=%s", vu_socket_group, 0),
     LL_OPTION("--fd=%d", vu_listen_fd, 0),
     LL_OPTION("--thread-pool-size=%d", thread_pool_size, 0),
+    LL_OPTION("--uring-size=%d", uring_size, 0),
     FUSE_OPT_END
 };
 
@@ -2538,8 +2535,10 @@ void fuse_lowlevel_help(void)
         "    --socket-path=PATH         path for the vhost-user socket\n"
         "    --socket-group=GRNAME      name of group for the vhost-user socket\n"
         "    --fd=FDNUM                 fd number of vhost-user socket\n"
-        "    --thread-pool-size=NUM     thread pool size limit (default %d)\n",
-        THREAD_POOL_SIZE);
+        "    --thread-pool-size=NUM     thread pool size limit (default %d)\n"
+        "    --uring-size=NUM           io_uring size (default %d)\n",
+        THREAD_POOL_SIZE,
+        URING_SIZE);
 }
 
 void fuse_session_destroy(struct fuse_session *se)
@@ -2594,6 +2593,7 @@ struct fuse_session *fuse_session_new(struct fuse_args *args,
     se->fd = -1;
     se->vu_listen_fd = -1;
     se->thread_pool_size = THREAD_POOL_SIZE;
+    se->uring_size = URING_SIZE;
     se->conn.max_write = UINT_MAX;
     se->conn.max_readahead = UINT_MAX;
 

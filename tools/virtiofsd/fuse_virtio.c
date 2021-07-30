@@ -24,8 +24,28 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <grp.h>
+#include <liburing.h>
 
 #include "libvhost-user.h"
+
+#define IORING_FEAT_FAST_POLL (1U << 5)
+#define MAX_NR_CQE 8192
+
+enum uring_fd_type {
+	KICK_FD,
+    KILL_FD,
+	READ_FD,
+	WRITE_FD,
+};
+
+struct uring_user_data {
+    enum uring_fd_type fd_type;
+    /* freed after io completion */
+    struct iovec *iov;
+    fuse_req_t fuse_req;
+    /* info about this read or write procedure, FUSE_BUF_IS_FD set*/
+    struct fuse_buf fd_buf;
+};
 
 struct fv_VuDev;
 struct fv_QueueInfo {
@@ -42,10 +62,18 @@ struct fv_QueueInfo {
     int qidx;
     int kick_fd;
     int kill_fd; /* For killing the thread */
+
+    /* io_uring, each queue has one instance */
+    struct io_uring uring;
+    /* TODO: io_uring params */
+    struct io_uring_params uring_params;
+
+    /* compute how many sqes each uring_submit should handle */
+    unsigned int nr_sqe;
 };
 
 /* A FUSE request */
-typedef struct {
+struct FVRequest {
     VuVirtqElement elem;
     struct fuse_chan ch;
 
@@ -53,9 +81,18 @@ typedef struct {
     unsigned bad_in_num;
     unsigned bad_out_num;
 
+    /* We have to free fbuf.mem io completion if we use iouring */
+    void *fbuf_mem;
+
+    /* We have to free pbufv after io completion if we use iouring and allocate a fuse_bufvec */
+    struct fuse_bufvec *pbufv;
+
+    /* used to compute wait_nr of uring_submit */
+    bool use_uring;
+
     /* Used to complete requests that involve no reply */
     bool reply_sent;
-} FVRequest;
+} ;
 
 /*
  * We pass the dev element into libvhost-user
@@ -261,7 +298,7 @@ static void vu_dispatch_unlock(struct fv_VuDev *vud)
 int virtio_send_msg(struct fuse_session *se, struct fuse_chan *ch,
                     struct iovec *iov, int count)
 {
-    FVRequest *req = container_of(ch, FVRequest, ch);
+    struct FVRequest *req = container_of(ch, struct FVRequest, ch);
     struct fv_QueueInfo *qi = ch->qi;
     VuDev *dev = &se->virtio_dev->dev;
     VuVirtq *q = vu_get_queue(dev, qi->qidx);
@@ -329,7 +366,7 @@ int virtio_send_data_iov(struct fuse_session *se, struct fuse_chan *ch,
                          struct iovec *iov, int count, struct fuse_bufvec *buf,
                          size_t len)
 {
-    FVRequest *req = container_of(ch, FVRequest, ch);
+    struct FVRequest *req = container_of(ch, struct FVRequest, ch);
     struct fv_QueueInfo *qi = ch->qi;
     VuDev *dev = &se->virtio_dev->dev;
     VuVirtq *q = vu_get_queue(dev, qi->qidx);
@@ -531,7 +568,7 @@ static void fv_queue_worker(gpointer data, gpointer user_data)
     struct fv_QueueInfo *qi = user_data;
     struct fuse_session *se = qi->virtio_dev->se;
     struct VuDev *dev = &qi->virtio_dev->dev;
-    FVRequest *req = data;
+    struct FVRequest *req = data;
     VuVirtqElement *elem = &req->elem;
     struct fuse_buf fbuf = {};
     bool allocated_bufv = false;
@@ -590,171 +627,145 @@ static void fv_queue_worker(gpointer data, gpointer user_data)
                  elem->index);
         assert(0); /* TODO */
     }
+
     /* Copy just the fuse_in_header and look at it */
     copy_from_iov(&fbuf, out_num_readable, out_sg,
                   sizeof(struct fuse_in_header));
+
+    /* We keep the original fuse_n_header */
     memcpy(&inh, fbuf.mem, sizeof(struct fuse_in_header));
 
-    pbufv = NULL; /* Compiler thinks an unitialised path */
+    /* Compiler thinks an unitialised path */
+    pbufv = NULL;
+
     if (req->bad_in_num || req->bad_out_num) {
-        bool handled_unmappable = false;
-
-        if (!req->bad_in_num &&
-            inh.opcode == FUSE_WRITE &&
-            out_len_readable >= (sizeof(struct fuse_in_header) +
-                                 sizeof(struct fuse_write_in))) {
-            handled_unmappable = true;
-
-            /* copy the fuse_write_in header after fuse_in_header */
-            fbuf.size = copy_from_iov(&fbuf, out_num_readable, out_sg,
-                                      sizeof(struct fuse_in_header) +
-                                      sizeof(struct fuse_write_in));
-            /* That copy reread the in_header, make sure we use the original */
-            memcpy(fbuf.mem, &inh, sizeof(struct fuse_in_header));
-
-            /* Allocate the bufv, with space for the rest of the iov */
-            pbufv = malloc(sizeof(struct fuse_bufvec) +
-                           sizeof(struct fuse_buf) * out_num);
-            if (!pbufv) {
-                fuse_log(FUSE_LOG_ERR, "%s: pbufv malloc failed\n",
-                        __func__);
-                goto out;
-            }
-
-            allocated_bufv = true;
-            pbufv->count = 1;
-            pbufv->buf[0] = fbuf;
-
-            size_t iovindex, pbufvindex, iov_bytes_skip;
-            pbufvindex = 1; /* 2 headers, 1 fusebuf */
-
-            if (!skip_iov(out_sg, out_num,
-                          sizeof(struct fuse_in_header) +
-                          sizeof(struct fuse_write_in),
-                          &iovindex, &iov_bytes_skip)) {
-                fuse_log(FUSE_LOG_ERR, "%s: skip failed\n",
-                        __func__);
-                goto out;
-            }
-
-            for (; iovindex < out_num; iovindex++, pbufvindex++) {
-                pbufv->count++;
-                pbufv->buf[pbufvindex].pos = ~0; /* Dummy */
-                pbufv->buf[pbufvindex].flags =
-                    (iovindex < out_num_readable) ? 0 :
-                                                    FUSE_BUF_PHYS_ADDR;
-                pbufv->buf[pbufvindex].mem = out_sg[iovindex].iov_base;
-                pbufv->buf[pbufvindex].size = out_sg[iovindex].iov_len;
-
-                if (iov_bytes_skip) {
-                    pbufv->buf[pbufvindex].mem += iov_bytes_skip;
-                    pbufv->buf[pbufvindex].size -= iov_bytes_skip;
-                    iov_bytes_skip = 0;
-                }
-            }
-        }
-
-        if (req->bad_in_num &&
-            inh.opcode == FUSE_READ &&
-            out_len_readable >=
-                (sizeof(struct fuse_in_header) + sizeof(struct fuse_read_in))) {
-            fuse_log(FUSE_LOG_DEBUG,
-                     "Unmappable read case "
-                     "in_num=%d bad_in_num=%d\n",
-                     elem->in_num, req->bad_in_num);
-            handled_unmappable = true;
-        }
-
-        if (!handled_unmappable) {
-            fuse_log(FUSE_LOG_ERR,
-                     "Unhandled unmappable element: out: %d(b:%d) in: "
-                     "%d(b:%d)",
-                     out_num, req->bad_out_num, elem->in_num, req->bad_in_num);
-            fv_panic(dev, "Unhandled unmappable element");
-        }
+        fuse_log(FUSE_LOG_ERR, "%s: req->bad_in_num || req->bad_out_num,"
+        " we do not support this right now.\n",
+         __func__);
+        assert(0); /* TODO */
     }
 
-    if (!req->bad_out_num) {
-        if (inh.opcode == FUSE_WRITE &&
-            out_len_readable >= (sizeof(struct fuse_in_header) +
-                                 sizeof(struct fuse_write_in))) {
-            /*
-             * For a write we don't actually need to copy the
-             * data, we can just do it straight out of guest memory
-             * but we must still copy the headers in case the guest
-             * was nasty and changed them while we were using them.
-             */
-            fuse_log(FUSE_LOG_DEBUG, "%s: Write special case\n",
-                     __func__);
+    /* Specially handle write requests with liburing */
+    if (inh.opcode == FUSE_WRITE) {
+        /* TODO: What if (sizeof(struct fuse_in_header)
+        <= out_len_readable
+        < (sizeof(struct fuse_in_header) + sizeof(struct fuse_write_in))
+        */
+        assert(out_len_readable >=
+                            (sizeof(struct fuse_in_header)
+                            + sizeof(struct fuse_write_in)));
+        /*
+        * For a write we don't actually need to copy the
+        * data, we can just do it straight out of guest memory
+        * but we must still copy the headers in case the guest
+        * was nasty and changed them while we were using them.
+        */
+        fuse_log(FUSE_LOG_DEBUG, "%s: Write special case\n",
+                __func__);
 
-            fbuf.size = copy_from_iov(&fbuf, out_num, out_sg,
-                                      sizeof(struct fuse_in_header) +
-                                      sizeof(struct fuse_write_in));
-            /* That copy reread the in_header, make sure we use the original */
-            memcpy(fbuf.mem, &inh, sizeof(struct fuse_in_header));
+        fbuf.size = copy_from_iov(&fbuf, out_num, out_sg,
+                                sizeof(struct fuse_in_header) +
+                                sizeof(struct fuse_write_in));
 
-            /* Allocate the bufv, with space for the rest of the iov */
-            pbufv = malloc(sizeof(struct fuse_bufvec) +
-                           sizeof(struct fuse_buf) * out_num);
-            if (!pbufv) {
-                fuse_log(FUSE_LOG_ERR, "%s: pbufv malloc failed\n",
-                        __func__);
-                goto out;
-            }
+        /* That copy reread the in_header, make sure we use the original */
+        memcpy(fbuf.mem, &inh, sizeof(struct fuse_in_header));
 
-            allocated_bufv = true;
-            pbufv->count = 1;
-            pbufv->buf[0] = fbuf;
-
-            size_t iovindex, pbufvindex, iov_bytes_skip;
-            pbufvindex = 1; /* 2 headers, 1 fusebuf */
-
-            if (!skip_iov(out_sg, out_num,
-                          sizeof(struct fuse_in_header) +
-                          sizeof(struct fuse_write_in),
-                          &iovindex, &iov_bytes_skip)) {
-                fuse_log(FUSE_LOG_ERR, "%s: skip failed\n",
-                        __func__);
-                goto out;
-            }
-
-            for (; iovindex < out_num; iovindex++, pbufvindex++) {
-                pbufv->count++;
-                pbufv->buf[pbufvindex].pos = ~0; /* Dummy */
-                pbufv->buf[pbufvindex].flags = 0;
-                pbufv->buf[pbufvindex].mem = out_sg[iovindex].iov_base;
-                pbufv->buf[pbufvindex].size = out_sg[iovindex].iov_len;
-
-                if (iov_bytes_skip) {
-                    pbufv->buf[pbufvindex].mem += iov_bytes_skip;
-                    pbufv->buf[pbufvindex].size -= iov_bytes_skip;
-                    iov_bytes_skip = 0;
-                }
-            }
-        } else {
-            /* Normal (non fast write) path */
-
-            /* Copy the rest of the buffer */
-            copy_from_iov(&fbuf, out_num, out_sg, se->bufsize);
-            /* That copy reread the in_header, make sure we use the original */
-            memcpy(fbuf.mem, &inh, sizeof(struct fuse_in_header));
-
-            fbuf.size = out_len;
-
-            /* TODO! Endianness of header */
-
-            /* TODO: Add checks for fuse_session_exited */
-            bufv.buf[0] = fbuf;
-            bufv.count = 1;
-            pbufv = &bufv;
+        /* Allocate the pbufv, with space for the rest of the iov */
+        /* sizeof(struct fuse_bufvec): stores metadata and the fuse_in_header(buf[0]) */
+        /* sizeof(struct fuse_buf) * out_num: stores the iov except fuse_in_header */
+        pbufv = malloc(sizeof(struct fuse_bufvec) +
+                    sizeof(struct fuse_buf) * out_num);
+        if (!pbufv) {
+            fuse_log(FUSE_LOG_ERR, "%s: pbufv malloc failed\n",
+                    __func__);
+            assert(0);
         }
+
+        allocated_bufv = true;
+        pbufv->count = 1;
+        pbufv->buf[0] = fbuf;
+
+        size_t iovindex, pbufvindex, iov_bytes_skip;
+        /* pbufv->buf[0] = fuse_in_header + fuse_write_in */
+        pbufvindex = 1;
+
+        if (!skip_iov(out_sg, out_num,
+                    sizeof(struct fuse_in_header) +
+                    sizeof(struct fuse_write_in),
+                    &iovindex, &iov_bytes_skip)) {
+            fuse_log(FUSE_LOG_ERR, "%s: skip failed\n",
+                    __func__);
+            assert(0);
+        }
+
+        for (; iovindex < out_num; iovindex++, pbufvindex++) {
+            pbufv->count++;
+            pbufv->buf[pbufvindex].pos = ~0; /* Dummy */
+            pbufv->buf[pbufvindex].flags = 0;
+            pbufv->buf[pbufvindex].mem = out_sg[iovindex].iov_base;
+            pbufv->buf[pbufvindex].size = out_sg[iovindex].iov_len;
+
+            if (iov_bytes_skip) {
+                pbufv->buf[pbufvindex].mem += iov_bytes_skip;
+                pbufv->buf[pbufvindex].size -= iov_bytes_skip;
+                iov_bytes_skip = 0;
+            }
+        }
+
+        /*
+        * Now pbufv->buf[0](we alloc its mem) contains
+        * one fuse_in_header and one fuse_write_in.
+        * pbufv->buf[1] contains write data mem ptr
+        * (no data copy, just point to some area in guest memory)
+        */
+
+    } else {
+        /* Normal (non fast write) path */
+
+        /* Copy all of the buffer */
+        copy_from_iov(&fbuf, out_num, out_sg, se->bufsize);
+
+        /* That copy reread the in_header, make sure we use the original */
+        memcpy(fbuf.mem, &inh, sizeof(struct fuse_in_header));
+
+        /* TODO: Is se->bufsize always bigger than out_len? */
+        assert(se->bufsize >= out_len);
+
+        fbuf.size = out_len;
+
+        /* TODO: Endianness of header */
+
+        /* TODO: Add checks for fuse_session_exited */
+
+        bufv.buf[0] = fbuf;
+        bufv.count = 1;
+        pbufv = &bufv;
     }
+
     pbufv->idx = 0;
     pbufv->off = 0;
+
+    /* We need to increase qi->wait_nr */
     fuse_session_process_buf_int(se, pbufv, &req->ch);
 
-out:
-    if (allocated_bufv) {
+    if (inh.opcode == FUSE_WRITE || inh.opcode == FUSE_READ) {
+        /* For FUSE_WRITE and FUSE_READ, we have just submitted the I/O yet */
+        fuse_log(FUSE_LOG_DEBUG, "%s: FUSE_WRITE or FUSE_READ,"
+                "we are going to return now because we use liburing\n",
+                __func__);
+
+        if (allocated_bufv) {
+            free(pbufv);
+        }
+
+        free(fbuf.mem);
+
+        return;
+    }
+
+
+    /* without io_uring */
+   if (allocated_bufv) {
         free(pbufv);
     }
 
@@ -785,115 +796,181 @@ static void *fv_queue_thread(void *opaque)
     struct VuDev *dev = &qi->virtio_dev->dev;
     struct VuVirtq *q = vu_get_queue(dev, qi->qidx);
     struct fuse_session *se = qi->virtio_dev->se;
-    GThreadPool *pool = NULL;
+    struct io_uring_cqe *cqes[MAX_NR_CQE];
     GList *req_list = NULL;
 
     if (se->thread_pool_size) {
-        fuse_log(FUSE_LOG_DEBUG, "%s: Creating thread pool for Queue %d\n",
+        fuse_log(FUSE_LOG_ERR, "%s: Do not support thread_pool now %d\n",
                  __func__, qi->qidx);
-        pool = g_thread_pool_new(fv_queue_worker, qi, se->thread_pool_size,
-                                 FALSE, NULL);
-        if (!pool) {
-            fuse_log(FUSE_LOG_ERR, "%s: g_thread_pool_new failed\n", __func__);
-            return NULL;
-        }
+        exit(EXIT_FAILURE);
     }
 
-    fuse_log(FUSE_LOG_INFO, "%s: Start for queue %d kick_fd %d\n", __func__,
-             qi->qidx, qi->kick_fd);
+    /* init io_uring */
+    memset(&qi->uring_params, 0, sizeof(qi->uring_params));
+	if (io_uring_queue_init_params(se->uring_size, &qi->uring, &qi->uring_params) < 0) {
+        fuse_log(FUSE_LOG_ERR, "%s: io_uring_queue_init_params of queue %d failed: %s\n",
+                 __func__, qi->qidx, strerror(errno));
+        exit(EXIT_FAILURE);
+	}
+
+	if (!(qi->uring_params.features & IORING_FEAT_FAST_POLL)) {
+        fuse_log(FUSE_LOG_ERR, "%s: IORING_FEAT_FAST_POLL not available in the kernel.\n",
+                 __func__);
+        exit(EXIT_FAILURE);
+	}
+
+    /* prepare polling for kick_fd and kill_fd */
+	if(uring_prep_poll(&qi->uring, qi->kick_fd, KICK_FD, POLLIN, 0) < 0) {
+        fuse_log(FUSE_LOG_ERR, "%s: prepare uring_poll for kick_fd of queue: %d failed.\n",
+                 __func__, qi->qidx);
+        exit(EXIT_FAILURE);
+    }
+
+    if(uring_prep_poll(&qi->uring, qi->kill_fd, KILL_FD, POLLIN,  0) < 0) {
+        fuse_log(FUSE_LOG_ERR, "%s: prepare uring_poll for kill_fd of queue: %d failed.\n",
+                 __func__, qi->qidx);
+        exit(EXIT_FAILURE);
+    }
+
+    if(io_uring_submit_and_wait(&qi->uring, 1) < 0) {
+        fuse_log(FUSE_LOG_ERR, "%s: io_uring submit sqes failed.\n",
+                 __func__);
+        exit(EXIT_FAILURE);
+    }
+
+    fuse_log(FUSE_LOG_INFO, "%s: Start for queue %d kick_fd %d\n", __func__, qi->qidx, qi->kick_fd);
+
     while (1) {
-        struct pollfd pf[2];
+        int i;
+        unsigned int nr_cqe = 0;
+        nr_cqe = io_uring_peek_batch_cqe(&qi->uring, cqes,
+					sizeof(cqes) / sizeof(cqes[0]));
 
-        pf[0].fd = qi->kick_fd;
-        pf[0].events = POLLIN;
-        pf[0].revents = 0;
-        pf[1].fd = qi->kill_fd;
-        pf[1].events = POLLIN;
-        pf[1].revents = 0;
+        if (nr_cqe == 0) {
+            continue;
+        }
 
-        fuse_log(FUSE_LOG_DEBUG, "%s: Waiting for Queue %d event\n", __func__,
-                 qi->qidx);
-        int poll_res = ppoll(pf, 2, NULL, NULL);
+        fuse_log(FUSE_LOG_DEBUG, "%s: nr_cqe: %d on Queue %d\n",
+                                __func__, nr_cqe, qi->qidx);
 
-        if (poll_res == -1) {
-            if (errno == EINTR) {
-                fuse_log(FUSE_LOG_INFO, "%s: ppoll interrupted, going around\n",
-                         __func__);
-                continue;
-            }
-            fuse_log(FUSE_LOG_ERR, "fv_queue_thread ppoll: %m\n");
-            break;
-        }
-        assert(poll_res >= 1);
-        if (pf[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            fuse_log(FUSE_LOG_ERR, "%s: Unexpected poll revents %x Queue %d\n",
-                     __func__, pf[0].revents, qi->qidx);
-            break;
-        }
-        if (pf[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            fuse_log(FUSE_LOG_ERR,
-                     "%s: Unexpected poll revents %x Queue %d killfd\n",
-                     __func__, pf[1].revents, qi->qidx);
-            break;
-        }
-        if (pf[1].revents) {
-            fuse_log(FUSE_LOG_INFO, "%s: kill event on queue %d - quitting\n",
+        for (i = 0; i < nr_cqe; ++i) {
+            struct io_uring_cqe *cqe = cqes[i];
+			struct uring_user_data *uud = io_uring_cqe_get_data(cqe);
+
+            /* kick_fd is ready to be read */
+            if(uud->fd_type == KICK_FD) {
+
+                if(cqe->res < 0) {
+                    if(cqe->res == -EINTR) {
+                        fuse_log(FUSE_LOG_INFO, "%s: cqe->res == -EINTR on Queue %d\n",
+                                __func__, qi->qidx);
+                        continue;
+                    }
+                    fuse_log(FUSE_LOG_ERR, "%s: cqe->res: %s on Queue %d\n",
+                            __func__, strerror(-cqe->res), qi->qidx);
+                    goto out;
+                }
+
+                eventfd_t evalue;
+                if (eventfd_read(qi->kick_fd, &evalue)) {
+                    fuse_log(FUSE_LOG_ERR, "%s: eventfd_read for queue: %d failed\n",
+                        __func__, qi->qidx);
+                    exit(EXIT_FAILURE);
+                }
+
+                /* TODO: handle requests in vu_queue */
+
+                /* Mutual exclusion with virtio_loop() */
+                vu_dispatch_rdlock(qi->virtio_dev);
+                pthread_mutex_lock(&qi->vq_lock);
+
+                /* out is from guest, in is too guest */
+                unsigned int in_bytes, out_bytes;
+                vu_queue_get_avail_bytes(dev, q, &in_bytes, &out_bytes, ~0, ~0);
+
+                fuse_log(FUSE_LOG_DEBUG,
+                        "%s: Got queue event on Queue %d, "
+                        "evalue: %zx available: in: %u out: %u\n",
+                        __func__, qi->qidx, (size_t)evalue, in_bytes, out_bytes);
+
+                while (1) {
+                    unsigned int bad_in_num = 0, bad_out_num = 0;
+                    struct FVRequest *req = vu_queue_pop(dev, q, sizeof(struct FVRequest),
+                                                &bad_in_num, &bad_out_num);
+                    if (!req) {
+                        break;
+                    }
+
+                    req->reply_sent = false;
+                    req->bad_in_num = bad_in_num;
+                    req->bad_out_num = bad_out_num;
+
+                    req_list = g_list_prepend(req_list, req);
+                }
+
+                pthread_mutex_unlock(&qi->vq_lock);
+                vu_dispatch_unlock(qi->virtio_dev);
+
+                qi->nr_sqe = 0;
+                fuse_log(FUSE_LOG_DEBUG, "%s: process requests(count: %zd) for Queue %d this time\n",
+                            __func__, (size_t)g_list_length(req_list), qi->qidx);
+
+                if(req_list != NULL) {
+                    g_list_foreach(req_list, fv_queue_worker, qi);
+                    g_list_free(req_list);
+                    req_list = NULL;
+                }
+
+	            /* after popping the vu_queue, we should restart polling kick_fd for future requests */
+                if(uring_prep_poll(&qi->uring, qi->kick_fd, KICK_FD, POLLIN, 0) < 0) {
+                    fuse_log(FUSE_LOG_ERR, "%s: prepare uring_poll for kick_fd of queue: %d failed.\n",
                      __func__, qi->qidx);
-            break;
-        }
-        assert(pf[0].revents & POLLIN);
-        fuse_log(FUSE_LOG_DEBUG, "%s: Got queue event on Queue %d\n", __func__,
-                 qi->qidx);
+                    exit(EXIT_FAILURE);
+                }
 
-        eventfd_t evalue;
-        if (eventfd_read(qi->kick_fd, &evalue)) {
-            fuse_log(FUSE_LOG_ERR, "Eventfd_read for queue: %m\n");
-            break;
-        }
-        /* Mutual exclusion with virtio_loop() */
-        vu_dispatch_rdlock(qi->virtio_dev);
-        pthread_mutex_lock(&qi->vq_lock);
-        /* out is from guest, in is too guest */
-        unsigned int in_bytes, out_bytes;
-        vu_queue_get_avail_bytes(dev, q, &in_bytes, &out_bytes, ~0, ~0);
+                fuse_log(FUSE_LOG_DEBUG, "%s: submit %d sqes(1 for kick_fd and others for w/r)"
+                                        "for Queue %d now\n", __func__, qi->nr_sqe + 1, qi->qidx);
 
-        fuse_log(FUSE_LOG_DEBUG,
-                 "%s: Queue %d gave evalue: %zx available: in: %u out: %u\n",
-                 __func__, qi->qidx, (size_t)evalue, in_bytes, out_bytes);
-
-        while (1) {
-            unsigned int bad_in_num = 0, bad_out_num = 0;
-            FVRequest *req = vu_queue_pop(dev, q, sizeof(FVRequest),
-                                          &bad_in_num, &bad_out_num);
-            if (!req) {
-                break;
-            }
-
-            req->reply_sent = false;
-            req->bad_in_num = bad_in_num;
-            req->bad_out_num = bad_out_num;
-
-            if (!se->thread_pool_size) {
-                req_list = g_list_prepend(req_list, req);
-            } else {
-                g_thread_pool_push(pool, req, NULL);
-            }
-        }
-
-        pthread_mutex_unlock(&qi->vq_lock);
-        vu_dispatch_unlock(qi->virtio_dev);
-
-        /* Process all the requests. */
-        if (!se->thread_pool_size && req_list != NULL) {
-            g_list_foreach(req_list, fv_queue_worker, qi);
-            g_list_free(req_list);
-            req_list = NULL;
-        }
+                /* qi->nr_sqe + 1 because we have one more kick_fd to poll for */
+                if(io_uring_submit_and_wait(&qi->uring, qi->nr_sqe + 1) < 0) {
+                    fuse_log(FUSE_LOG_ERR, "%s: io_uring submit sqes failed.\n",
+                            __func__);
+                    exit(EXIT_FAILURE);
+                }
+				free(uud);
+    			io_uring_cqe_seen(&qi->uring, cqe);
+            /* TODO: We should use callback to handle WRITE_FD and READ_FD gracefully */
+            /* write completion */
+            } else if (uud->fd_type == WRITE_FD) {
+                fuse_log(FUSE_LOG_DEBUG, "%s: write completion, queue: %d.\n",
+                     __func__, qi->qidx);
+                fuse_uring_complete_write(uud, cqe->res);
+				free(uud);
+                io_uring_cqe_seen(&qi->uring, cqe);
+			/* read completion */
+            } else if (uud->fd_type == READ_FD) {
+                fuse_log(FUSE_LOG_DEBUG, "%s: read completion, queue: %d.\n",
+                     __func__, qi->qidx);
+                fuse_uring_complete_read(uud, cqe->res);
+				free(uud);
+				io_uring_cqe_seen(&qi->uring, cqe);
+			/* we are notified to quit now */
+            } else if (uud->fd_type == KILL_FD) {
+				fuse_log(FUSE_LOG_INFO, "%s: kill event on queue %d - quitting\n",
+                     __func__, qi->qidx);
+				free(uud);
+                io_uring_cqe_seen(&qi->uring, cqe);
+                goto out;
+			}
+		}
     }
 
-    if (pool) {
-        g_thread_pool_free(pool, FALSE, TRUE);
-    }
+out:
+    io_uring_queue_exit(&qi->uring);
+
+    fuse_log(FUSE_LOG_INFO,
+        "%s: Thread for queue %d is killed now, exiting...\n",
+        __func__, qi->qidx);
 
     return NULL;
 }
@@ -1319,4 +1396,368 @@ ssize_t fuse_virtio_write(fuse_req_t req, const struct fuse_buf *dst,
     fuse_log(FUSE_LOG_DEBUG, "%s: result=%" PRId64 " \n", __func__, result);
     g_free(msg);
     return result;
+}
+
+
+int uring_prep_poll(struct io_uring *ring, int fd,
+					enum uring_fd_type fd_type,
+					short poll_mask, unsigned flags)
+{
+	struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+	if (!sqe)
+		return -1;
+	struct uring_user_data *uud = calloc(1, sizeof(struct uring_user_data));
+	if (!uud) {
+		return -1;
+	}
+	io_uring_prep_poll_add(sqe, fd, poll_mask);
+	io_uring_sqe_set_flags(sqe, flags);
+
+	uud->fd_type = fd_type;
+
+	io_uring_sqe_set_data(sqe, uud);
+
+	return 0;
+}
+
+void fuse_uring_complete_read(struct uring_user_data *uud, int res)
+{
+	fuse_req_t fuse_req = uud->fuse_req;
+	struct fuse_chan *ch = fuse_req->ch;
+	struct FVRequest *fv_req = container_of(ch, struct FVRequest, ch);
+	struct fv_QueueInfo *qi = ch->qi;
+    VuDev *dev = &qi->virtio_dev->dev;
+    VuVirtq *q = vu_get_queue(dev, qi->qidx);
+
+	/* The 'in' part of the elem is to qemu */
+    VuVirtqElement *elem = &fv_req->elem;
+    struct iovec *in_sg = elem->in_sg;
+	struct fuse_out_header *out_sg = in_sg[0].iov_base;
+
+	assert(out_sg);
+
+	size_t tosend_len = out_sg->len;
+
+	free(uud->iov);
+
+	if(res < 0) {
+		fuse_log(FUSE_LOG_ERR, "%s: [uring readv] failed, res: %s\n",
+            	__func__, strerror(-res));
+		fuse_reply_err(fuse_req, -res);
+ 	} else {
+		struct fuse_buf *read_buf = &uud->fd_buf;
+		fuse_log(FUSE_LOG_DEBUG, "%s: [uring readv complete] res: %d, unique: %lu, fd: %d, size: %zd, pos: %zd\n",
+				__func__,
+				res,
+                fuse_req->unique,
+				read_buf->fd,
+				read_buf->size,
+				read_buf->pos);
+
+		/* This could happen when EOF reaches or signal occurs */
+		/* TODO: Should we retry uring read when signal occurs? */
+		if(res && res < read_buf->size) {
+			fuse_log(FUSE_LOG_DEBUG,
+				"%s: [uring readv complete], res < size\n",
+				__func__);
+		}
+		/* This could happen when we just read an EOF */
+		if(res == 0) {
+			fuse_log(FUSE_LOG_DEBUG,
+				"%s: [uring readv complete], res == 0\n",
+				__func__);
+		}
+
+		/* Need to fix out->len on EOF */
+		if (res >= 0 && res < read_buf->size) {
+        	fuse_log(FUSE_LOG_INFO, "%s: Need to fix out_sg->len on EOF\n", __func__);
+            tosend_len -= read_buf->size - res;
+        	out_sg->len = tosend_len;
+		}
+
+        fuse_log(FUSE_LOG_DEBUG, "%s: out_sg-len: %d, tosend_len: %zd, res: %d\n", __func__, out_sg->len, tosend_len, res);
+
+ 		vu_dispatch_rdlock(qi->virtio_dev);
+		pthread_mutex_lock(&qi->vq_lock);
+		vu_queue_push(dev, q, elem, tosend_len);
+		vu_queue_notify(dev, q);
+		pthread_mutex_unlock(&qi->vq_lock);
+		vu_dispatch_unlock(qi->virtio_dev);
+
+		fv_req->reply_sent = true;
+		fuse_free_req(fuse_req);
+	}
+
+	/* Now fuse_req has been freed */
+
+    /* If the request has no reply, still recycle the virtqueue element */
+    if (!fv_req->reply_sent) {
+        fuse_log(FUSE_LOG_DEBUG, "%s: elem %d no reply sent\n", __func__,
+                 elem->index);
+
+        vu_dispatch_rdlock(qi->virtio_dev);
+        pthread_mutex_lock(&qi->vq_lock);
+        vu_queue_push(dev, q, elem, 0);
+        vu_queue_notify(dev, q);
+        pthread_mutex_unlock(&qi->vq_lock);
+        vu_dispatch_unlock(qi->virtio_dev);
+    }
+
+    pthread_mutex_destroy(&ch->lock);
+    free(fv_req);
+}
+
+int fuse_uring_prep_read(fuse_req_t fuse_req,
+					  struct fuse_bufvec *out_buf,
+					  unsigned flags)
+{
+	struct io_uring_sqe *sqe;
+	struct uring_user_data *uud;
+	struct fuse_chan *ch = fuse_req->ch;
+	struct fuse_session *se = fuse_req->se;
+	assert(ch);
+	struct FVRequest *fv_req = container_of(ch, struct FVRequest, ch);
+	struct fv_QueueInfo *qi = ch->qi;
+	assert(qi);
+	struct io_uring *ring = &qi->uring;
+	assert(ring);
+
+	struct fuse_out_header out_header = {};
+	struct iovec out_header_iovs[1];
+
+	/* data size + header size */
+	size_t tosend_len;
+
+	/* The 'in' part of the elem is to qemu */
+    VuVirtqElement *elem = &fv_req->elem;
+	unsigned int in_num = elem->in_num;
+    unsigned int bad_in_num = fv_req->bad_in_num;
+    struct iovec *in_sg = elem->in_sg;
+	size_t in_len = iov_size(in_sg, in_num);
+    size_t in_len_writeable = iov_size(in_sg, in_num - bad_in_num);
+    struct iovec *in_sg_cpy;
+
+    fuse_log(FUSE_LOG_DEBUG, "%s: elem %d: with %d in desc of length %zd\n",
+             __func__, elem->index, in_num, in_len);
+
+	assert(bad_in_num == 0);
+
+	/* this assert is necessary */
+	assert(!fv_req->reply_sent);
+	assert(fuse_lowlevel_is_virtio(se)
+		&& out_buf->count == 1
+		&& out_buf->buf[0].flags == (FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK));
+
+	sqe = io_uring_get_sqe(ring);
+	assert(sqe);
+	uud = calloc(1, sizeof(struct uring_user_data));
+	assert(uud);
+
+	tosend_len = fuse_buf_size(out_buf) + sizeof(struct fuse_out_header);
+
+    /*
+     * The elem should have room for a 'fuse_out_header' (out from fuse)
+     * plus the data based on the len in the header.
+     */
+    if (in_len_writeable < sizeof(struct fuse_out_header)) {
+        fuse_log(FUSE_LOG_ERR, "%s: elem %d too short for out_header\n",
+                 __func__, elem->index);
+        assert(0);
+    }
+    if (in_len < tosend_len) {
+        fuse_log(FUSE_LOG_ERR, "%s: elem %d too small for data len %zd\n",
+                 __func__, elem->index, tosend_len);
+        assert(0);
+    }
+
+    out_header.unique = fuse_req->unique;
+	/* We need send the fuse_out_header and then the buffer */
+	out_header.len = tosend_len;
+
+    out_header_iovs[0].iov_base = &out_header;
+    out_header_iovs[0].iov_len = sizeof(struct fuse_out_header);
+
+	fuse_log(FUSE_LOG_DEBUG, "%s: len: %zd, header_len: %zd\n",
+            __func__,
+            fuse_buf_size(out_buf),
+            sizeof(struct fuse_out_header));
+
+    /* First copy the header data from out_header_iovs->in_sg */
+    copy_iov(out_header_iovs, 1, in_sg, in_num, sizeof(struct fuse_out_header));
+
+	/*
+     * Build a copy of the the in_sg iov so we can skip bits in it,
+     * including changing the offsets
+     */
+    in_sg_cpy = calloc(sizeof(struct iovec), in_num);
+    assert(in_sg_cpy);
+
+	memcpy(in_sg_cpy, in_sg, sizeof(struct iovec) * in_num);
+
+	/* skip over parts of in_sg that contained the header iov */
+    size_t skip_len = sizeof(struct fuse_out_header);
+
+	/* These get updated as we skip */
+    struct iovec *in_sg_cpy_ptr = in_sg_cpy;
+
+	/* These get updated as we skip */
+	int in_sg_cpy_count = in_num - bad_in_num;
+
+	while (skip_len != 0 && in_sg_cpy_count) {
+        if (skip_len >= in_sg_cpy_ptr[0].iov_len) {
+			skip_len -= in_sg_cpy_ptr[0].iov_len;
+			in_sg_cpy_ptr++;
+			in_sg_cpy_count--;
+		} else {
+			in_sg_cpy_ptr[0].iov_len -= skip_len;
+			in_sg_cpy_ptr[0].iov_base += skip_len;
+			break;
+		}
+    }
+
+	fuse_log(FUSE_LOG_DEBUG, "%s: [uring readv] unique: %lu, fd: %d, size: %zd, pos: %zd\n",
+                 __func__,
+                 fuse_req->unique,
+				 out_buf->buf[0].fd,
+				 out_buf->buf[0].size,
+				 out_buf->buf[0].pos);
+
+	io_uring_prep_readv(sqe, out_buf->buf[0].fd,
+						in_sg_cpy_ptr,
+						in_sg_cpy_count,
+						out_buf->buf[0].pos);
+
+	io_uring_sqe_set_flags(sqe, flags);
+
+	uud->fd_type = READ_FD;
+	uud->fuse_req = fuse_req;
+	uud->iov = in_sg_cpy;
+	uud->fd_buf = out_buf->buf[0];
+
+	io_uring_sqe_set_data(sqe, uud);
+
+	qi->nr_sqe++;
+
+	return 0;
+}
+
+void fuse_uring_complete_write(struct uring_user_data *uud, int res)
+{
+	fuse_req_t fuse_req = uud->fuse_req;
+	struct fuse_chan *ch = fuse_req->ch;
+	struct FVRequest *fv_req = container_of(ch, struct FVRequest, ch);
+    VuVirtqElement *elem = &fv_req->elem;
+	struct fv_QueueInfo *qi = ch->qi;
+    VuDev *dev = &qi->virtio_dev->dev;
+
+	free(uud->iov);
+
+	if (res < 0) {
+        fuse_log(FUSE_LOG_ERR, "%s: [uring writev] failed, res: %s\n",
+            	__func__, strerror(-res));
+		fuse_reply_err(fuse_req, -res);
+    } else {
+		struct fuse_buf *write_buf = &uud->fd_buf;
+		fuse_log(FUSE_LOG_DEBUG, "%s: [uring writev complete] res: %d, unique: %lu, fd: %d, size: %zd, pos: %zd\n",
+                 __func__,
+				 res,
+                 fuse_req->unique,
+				 write_buf->fd,
+				 write_buf->size,
+				 write_buf->pos);
+
+		/* This could happen when disk is full or signal occurs */
+		/* TODO: We should retry uring read when signal occurs */
+		if(res < write_buf->size) {
+			fuse_log(FUSE_LOG_INFO,
+				"%s: [uring writev complete], res < size\n", __func__);
+		}
+
+        fuse_log(FUSE_LOG_DEBUG, "%s: res: %d\n", __func__, res);
+		/* We just ignore any failure while replying write */
+		fuse_reply_write(fuse_req, (size_t)res);
+	}
+
+	/* Now fuse_req has been freed */
+
+    /* If the request has no reply, still recycle the virtqueue element */
+    if (!fv_req->reply_sent) {
+        VuVirtq *q = vu_get_queue(dev, qi->qidx);
+
+        fuse_log(FUSE_LOG_DEBUG, "%s: elem %d no reply sent\n", __func__,
+                 elem->index);
+
+        vu_dispatch_rdlock(qi->virtio_dev);
+        pthread_mutex_lock(&qi->vq_lock);
+        vu_queue_push(dev, q, elem, 0);
+        vu_queue_notify(dev, q);
+        pthread_mutex_unlock(&qi->vq_lock);
+        vu_dispatch_unlock(qi->virtio_dev);
+    }
+
+    pthread_mutex_destroy(&ch->lock);
+    free(fv_req);
+}
+
+
+int fuse_uring_prep_write(fuse_req_t fuse_req,
+					  struct fuse_bufvec *out_buf,
+					  struct fuse_bufvec *in_buf,
+					  unsigned flags)
+{
+	size_t iovcnt, i, j;
+    struct iovec *iov;
+	struct io_uring_sqe *sqe;
+	struct uring_user_data *uud;
+	struct fuse_chan *ch = fuse_req->ch;
+	assert(ch);
+	struct fv_QueueInfo *qi = ch->qi;
+	assert(qi);
+	struct io_uring *ring = &qi->uring;
+	assert(ring);
+
+	assert(out_buf->buf[0].flags == (FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK));
+
+	sqe = io_uring_get_sqe(ring);
+	if (!sqe)
+		return -1;
+
+	uud = calloc(1, sizeof(struct uring_user_data));
+	if (!uud)
+		return -ENOMEM;
+
+	iovcnt = in_buf->count;
+	iov = calloc(iovcnt, sizeof(struct iovec));
+    if (!iov) {
+        return -ENOMEM;
+    }
+	for (i = 0, j = 0; i < iovcnt; i++) {
+        /* Skip the buf with 0 size */
+        if (in_buf->buf[i].size) {
+            iov[j].iov_base = in_buf->buf[i].mem;
+            iov[j].iov_len = in_buf->buf[i].size;
+            j++;
+        }
+    }
+
+	fuse_log(FUSE_LOG_DEBUG,
+                 "%s: [uring writev], unique: %lu, fd: %d, size: %zd, pos: %zd\n",
+                 __func__,
+                 fuse_req->unique,
+				 out_buf->buf[0].fd,
+				 out_buf->buf[0].size,
+				 out_buf->buf[0].pos);
+
+	io_uring_prep_writev(sqe, out_buf->buf[0].fd, iov, iovcnt, out_buf->buf[0].pos);
+	io_uring_sqe_set_flags(sqe, flags);
+
+	uud->fd_type = WRITE_FD;
+	uud->fuse_req = fuse_req;
+	uud->iov = iov;
+	uud->fd_buf = out_buf->buf[0];
+	io_uring_sqe_set_data(sqe, uud);
+
+	qi->nr_sqe++;
+
+	return 0;
 }
