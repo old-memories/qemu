@@ -2571,6 +2571,7 @@ struct fuse_session *fuse_session_new(struct fuse_args *args,
                                       size_t op_size, void *userdata)
 {
     struct fuse_session *se;
+    struct fuse_conn_info_opts *conn_opts;
 
     if (sizeof(struct fuse_lowlevel_ops) < op_size) {
         fuse_log(
@@ -2597,10 +2598,20 @@ struct fuse_session *fuse_session_new(struct fuse_args *args,
     se->conn.max_write = UINT_MAX;
     se->conn.max_readahead = UINT_MAX;
 
+    conn_opts = fuse_parse_conn_info_opts(args);
+    assert(conn_opts);
+    fuse_apply_conn_info_opts(conn_opts, &se->conn);
+    free(conn_opts);
+
     /* Parse options */
     if (fuse_opt_parse(args, se, fuse_ll_opts, NULL) == -1) {
         goto out2;
     }
+
+    fuse_log(FUSE_LOG_INFO, "fuse: uring_size: %d, max_background: %u\n",
+                            se->uring_size,
+                            se->conn.max_background);
+
     if (args->argc == 1 && args->argv[0][0] == '-') {
         fuse_log(FUSE_LOG_ERR,
                  "fuse: warning: argv[0] looks like an option, but "
